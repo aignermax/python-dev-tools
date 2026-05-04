@@ -315,16 +315,16 @@ def build_index(repo_root: Path, force_rebuild: bool = False) -> Dict:
             # Indexing a large repo can take minutes and OpenAI 429/500 are
             # the most common transient failures. Surface enough context for
             # the user to know what failed and where, then re-raise — partial
-            # state is not safe to persist.
-            preview = batch[0][:80].replace("\n", " ") if batch else ""
+            # state is not safe to persist. Don't include the chunk content
+            # itself: it's user source code and could contain secrets that
+            # CI logs would archive.
             print(
                 f"ERROR: embedding batch {batch_num} failed "
                 f"({type(e).__name__}: {e}).",
                 file=sys.stderr,
             )
             print(
-                f"  items={len(batch)} chars={batch_chars} "
-                f"first_chunk_preview={preview!r}",
+                f"  items={len(batch)} chars={batch_chars}",
                 file=sys.stderr,
             )
             raise

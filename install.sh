@@ -11,7 +11,11 @@
 #   --no-venv    Skip the venv creation; assume openai/dotenv are reachable
 #                from the system python3.
 
+# `pipefail` is critical here — without it, a failing `curl` piped into
+# `tr` would still exit 0 because only `tr`'s exit status counts, and
+# we'd silently install empty executables on a 404.
 set -e
+set -o pipefail
 
 VERSION="2.0.0"
 INSTALL_DIR="$HOME/.cap-tools"
@@ -23,7 +27,13 @@ for arg in "$@"; do
     case "$arg" in
         --no-venv) SKIP_VENV=1 ;;
         --branch=*) BRANCH="${arg#--branch=}" ;;
-        *) ;;
+        --help|-h)
+            echo "Usage: install.sh [--no-venv] [--branch=NAME]"
+            exit 0
+            ;;
+        *)
+            echo "WARN: ignoring unknown argument: $arg" >&2
+            ;;
     esac
 done
 
@@ -50,11 +60,14 @@ for tool in "${TOOLS[@]}"; do
     # Strip CRLF on download — GitHub's raw endpoint preserves whatever
     # line endings are in the blob, and a stray \r in the shebang breaks
     # `#!/usr/bin/env python3` on Linux.
-    curl -sSL "$REPO_URL/$BRANCH/$tool" | tr -d '\r' > "$INSTALL_DIR/$tool"
+    # `-f` makes curl exit non-zero on HTTP errors (404, 500). Combined with
+    # `set -o pipefail` above, a missing tool aborts the install instead of
+    # producing a zero-byte executable.
+    curl -fsSL "$REPO_URL/$BRANCH/$tool" | tr -d '\r' > "$INSTALL_DIR/$tool"
     chmod +x "$INSTALL_DIR/$tool"
 done
 
-curl -sSL "$REPO_URL/$BRANCH/README.md" | tr -d '\r' > "$INSTALL_DIR/README.md"
+curl -fsSL "$REPO_URL/$BRANCH/README.md" | tr -d '\r' > "$INSTALL_DIR/README.md"
 
 echo ""
 echo "🐍 Checking Python..."
@@ -81,8 +94,11 @@ else
     fi
 
     echo "   installing openai, python-dotenv..."
-    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-    "$VENV_DIR/bin/pip" install --quiet openai python-dotenv
+    # No --quiet: pip's own error messages are the most useful signal when
+    # an install fails (offline, proxy, PEP 668), and `set -e` will abort
+    # the script anyway, so silencing them just hides the diagnosis.
+    "$VENV_DIR/bin/pip" install --upgrade pip
+    "$VENV_DIR/bin/pip" install openai python-dotenv
 
     # Point semantic_search.py's shebang at the venv so users can invoke
     # the script directly (`~/.cap-tools/semantic_search.py "query"`)
