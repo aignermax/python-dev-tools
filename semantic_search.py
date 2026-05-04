@@ -117,7 +117,13 @@ def extract_code_chunks(file_path: Path) -> List[Dict[str, str]]:
     """Extract meaningful chunks from a code file."""
     try:
         content = file_path.read_text(encoding='utf-8')
-    except:
+    except (UnicodeDecodeError, OSError) as e:
+        # Binary files, files with non-UTF-8 encoding, locked files, and
+        # permission errors are all expected during a recursive index.
+        # Log and skip so the user knows which files dropped out instead
+        # of silently missing them in search results. Don't catch broader
+        # than this — MemoryError, KeyboardInterrupt, etc. should propagate.
+        print(f"  Skip {file_path}: {type(e).__name__}: {e}", file=sys.stderr)
         return []
 
     if file_path.suffix == '.cs':
