@@ -21,16 +21,26 @@ from typing import List, Dict, Tuple
 import openai
 from dotenv import load_dotenv
 
-# Load environment variables — try multiple locations so the tool works
-# whether it's in ~/.cap-tools/ (parent.parent = $HOME) or tools/ inside a repo.
-for _env_candidate in [
-    Path.cwd() / ".env",                       # repo root (most common)
-    Path(__file__).parent / ".env",            # alongside the tool
-    Path(__file__).parent.parent / ".env",     # legacy (autonomous-issue-agent layout)
-]:
+# Load environment variables. Try multiple locations so the tool works
+# regardless of how it was installed (alongside a project, in a tools/ subdir,
+# or at a fixed user-global path with the project two directories away).
+_env_candidates = [
+    Path.cwd() / ".env",                    # repo root — most common when run from a project
+    Path(__file__).parent / ".env",         # next to the tool itself
+    Path(__file__).parent.parent / ".env",  # one level up from the tool
+]
+_env_loaded = False
+for _env_candidate in _env_candidates:
     if _env_candidate.exists():
         load_dotenv(_env_candidate)
+        _env_loaded = True
         break
+if not _env_loaded and not os.environ.get("OPENAI_API_KEY"):
+    print(
+        "WARN: no .env found and OPENAI_API_KEY is not set. Tried: "
+        + ", ".join(str(p) for p in _env_candidates),
+        file=sys.stderr,
+    )
 
 # Configuration
 CACHE_DIR = Path(__file__).parent / ".search_cache"
@@ -153,8 +163,9 @@ def _chunk_axaml(file_path: Path, content: str) -> List[Dict[str, str]]:
     lines = content.split('\n')
     chunks: List[Dict[str, str]] = []
 
-    # Chunk 1: Header — root element opener with all xmlns + x:DataType + x:Class.
-    # Find the position where the root element tag ends (first '>').
+    # The header chunk gets its own embedding because namespaces and
+    # x:DataType determine which ViewModel a search query should match —
+    # losing them in a generic body chunk hurts retrieval.
     header_end = content.find('>')
     header_line_count = 0
     if header_end != -1:
@@ -166,10 +177,9 @@ def _chunk_axaml(file_path: Path, content: str) -> List[Dict[str, str]]:
             'content': header_text[:3000],
         })
 
-    # Chunk 2..N: Structural sections at top-level indentation, starting AFTER
-    # the header to avoid overlap. Heuristic: any line whose stripped form
-    # starts with one of the known tags AND whose leading whitespace is
-    # <= 8 spaces is treated as a section start.
+    # Section start = top-level tag with <=8 leading spaces. The indent guard
+    # avoids false positives when the same tag name appears nested inside
+    # a control template.
     section_start = header_line_count
     section_lines: List[str] = []
     for i, line in enumerate(lines[header_line_count:], start=header_line_count):
@@ -202,12 +212,11 @@ def _chunk_axaml(file_path: Path, content: str) -> List[Dict[str, str]]:
                 'content': section_text[:4000],
             })
 
-    # Final chunk: compact binding index — captures every {Binding ...},
-    # x:DataType, x:Class, x:Name. Lets a single embedding cover all
-    # data-binding surfaces of the file.
+    # One additional chunk that concentrates every binding/x:* attribute,
+    # so a single embedding covers all data-binding surfaces of the file
+    # (queries like "binding for SomeViewModel" then need only one chunk hit).
     bindings = _AXAML_BINDING_RE.findall(content)
     if bindings:
-        # Deduplicate while preserving order
         seen = set()
         unique_bindings = []
         for b in bindings:
@@ -262,9 +271,11 @@ def build_index(repo_root: Path, force_rebuild: bool = False) -> Dict:
     print(f"Computing embeddings...", file=sys.stderr)
     texts = [chunk['content'] for chunk in all_chunks]
 
-    # Batch embeddings under both limits: max 2048 items AND ~280K chars
-    # per request (OpenAI's hard cap is 300K tokens; chars ≈ 4× tokens, so
-    # 280K chars stays well below 300K tokens for safety).
+    # OpenAI rejects embedding requests above 300K tokens. Tokens are
+    # roughly chars/4 for English-ish input but can be denser for source
+    # code, so we cap on chars conservatively: 280K chars ≈ 70K-280K
+    # tokens depending on tokenisation, leaving comfortable headroom under
+    # the 300K limit. The 2048 item cap is OpenAI's per-request maximum.
     MAX_ITEMS_PER_BATCH = 2048
     MAX_CHARS_PER_BATCH = 280_000
     all_embeddings = []
@@ -273,18 +284,25 @@ def build_index(repo_root: Path, force_rebuild: bool = False) -> Dict:
     batch_num = 0
 
     def flush_batch() -> None:
-        nonlocal batch, batch_chars, batch_num
+        nonlocal batch_chars, batch_num
         if not batch:
             return
         batch_num += 1
         print(f"  Batch {batch_num} ({len(batch)} items, {batch_chars} chars)", file=sys.stderr)
         response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
         all_embeddings.extend([item.embedding for item in response.data])
-        batch = []
+        batch.clear()
         batch_chars = 0
 
     for text in texts:
         text_len = len(text)
+        # A single chunk that already exceeds the per-batch char budget would
+        # be rejected by OpenAI on its own. Truncate defensively — chunkers
+        # currently cap at 5000 chars so this branch is unreachable today,
+        # but the guard prevents future chunker changes from regressing here.
+        if text_len > MAX_CHARS_PER_BATCH:
+            text = text[:MAX_CHARS_PER_BATCH]
+            text_len = MAX_CHARS_PER_BATCH
         if batch and (len(batch) >= MAX_ITEMS_PER_BATCH or batch_chars + text_len > MAX_CHARS_PER_BATCH):
             flush_batch()
         batch.append(text)
@@ -369,6 +387,9 @@ def main():
     # Fallback: use current working directory
     else:
         repo_root = Path.cwd()
+
+    # Resolve to absolute path (handles ../repo correctly)
+    repo_root = repo_root.resolve()
 
     if not repo_root.exists():
         print(f"ERROR: Repository not found at {repo_root}", file=sys.stderr)
