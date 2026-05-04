@@ -12,6 +12,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import hashlib
@@ -20,8 +21,16 @@ from typing import List, Dict, Tuple
 import openai
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv(Path(__file__).parent.parent / ".env")
+# Load environment variables — try multiple locations so the tool works
+# whether it's in ~/.cap-tools/ (parent.parent = $HOME) or tools/ inside a repo.
+for _env_candidate in [
+    Path.cwd() / ".env",                       # repo root (most common)
+    Path(__file__).parent / ".env",            # alongside the tool
+    Path(__file__).parent.parent / ".env",     # legacy (autonomous-issue-agent layout)
+]:
+    if _env_candidate.exists():
+        load_dotenv(_env_candidate)
+        break
 
 # Configuration
 CACHE_DIR = Path(__file__).parent / ".search_cache"
@@ -81,43 +90,134 @@ def extract_code_chunks(file_path: Path) -> List[Dict[str, str]]:
     except:
         return []
 
-    chunks = []
-
-    # For C# files, extract classes and methods
     if file_path.suffix == '.cs':
-        lines = content.split('\n')
-        current_chunk = []
-        chunk_start_line = 0
+        return _chunk_csharp(file_path, content)
+    if file_path.suffix == '.axaml':
+        return _chunk_axaml(file_path, content)
+    # Other files (e.g. .md): single truncated chunk
+    return [{
+        'file': str(file_path),
+        'lines': '1-end',
+        'content': content[:5000],
+    }]
 
-        for i, line in enumerate(lines):
-            stripped = line.strip()
 
-            # Start of class or method
-            if any(keyword in stripped for keyword in ['class ', 'interface ', 'public ', 'private ', 'protected ']):
-                if current_chunk:
-                    chunks.append({
-                        'file': str(file_path),
-                        'lines': f"{chunk_start_line}-{i}",
-                        'content': '\n'.join(current_chunk[:50])  # Limit to 50 lines per chunk
-                    })
-                current_chunk = [line]
-                chunk_start_line = i + 1
-            else:
-                current_chunk.append(line)
+def _chunk_csharp(file_path: Path, content: str) -> List[Dict[str, str]]:
+    """Chunk C# files at class/method boundaries."""
+    lines = content.split('\n')
+    chunks = []
+    current_chunk = []
+    chunk_start_line = 0
 
-        # Add last chunk
-        if current_chunk:
-            chunks.append({
-                'file': str(file_path),
-                'lines': f"{chunk_start_line}-{len(lines)}",
-                'content': '\n'.join(current_chunk[:50])
-            })
-    else:
-        # For other files, just use full content (truncated)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if any(kw in stripped for kw in ['class ', 'interface ', 'public ', 'private ', 'protected ']):
+            if current_chunk:
+                chunks.append({
+                    'file': str(file_path),
+                    'lines': f"{chunk_start_line}-{i}",
+                    'content': '\n'.join(current_chunk[:50]),
+                })
+            current_chunk = [line]
+            chunk_start_line = i + 1
+        else:
+            current_chunk.append(line)
+
+    if current_chunk:
         chunks.append({
             'file': str(file_path),
-            'lines': '1-end',
-            'content': content[:5000]  # First 5000 chars
+            'lines': f"{chunk_start_line}-{len(lines)}",
+            'content': '\n'.join(current_chunk[:50]),
+        })
+    return chunks
+
+
+# Top-level AXAML elements that mark a logical section boundary.
+_AXAML_TOP_LEVEL_TAGS = (
+    'Window.Resources', 'Window.Styles', 'Window.KeyBindings',
+    'UserControl.Resources', 'UserControl.Styles', 'UserControl.KeyBindings',
+    'Application.Resources', 'Application.Styles',
+    'DockPanel', 'Grid', 'StackPanel', 'TabControl', 'TabItem',
+    'ScrollViewer', 'Border', 'Panel', 'SplitView',
+)
+_AXAML_BINDING_RE = re.compile(r'\{Binding[^}]+\}|\{CompiledBinding[^}]+\}|x:DataType\s*=\s*"[^"]+"|x:Class\s*=\s*"[^"]+"|x:Name\s*=\s*"[^"]+"')
+
+
+def _chunk_axaml(file_path: Path, content: str) -> List[Dict[str, str]]:
+    """Chunk AXAML files into header, structural sections, and a binding index.
+
+    AXAML files are XML; semantically meaningful units are the root element header
+    (with namespaces and DataType), top-level structural blocks, and bindings.
+    Binding extraction creates a compact searchable index without re-reading the file.
+    """
+    lines = content.split('\n')
+    chunks: List[Dict[str, str]] = []
+
+    # Chunk 1: Header — root element opener with all xmlns + x:DataType + x:Class.
+    # Find the position where the root element tag ends (first '>').
+    header_end = content.find('>')
+    header_line_count = 0
+    if header_end != -1:
+        header_text = content[:header_end + 1]
+        header_line_count = header_text.count('\n') + 1
+        chunks.append({
+            'file': str(file_path),
+            'lines': f"1-{header_line_count}",
+            'content': header_text[:3000],
+        })
+
+    # Chunk 2..N: Structural sections at top-level indentation, starting AFTER
+    # the header to avoid overlap. Heuristic: any line whose stripped form
+    # starts with one of the known tags AND whose leading whitespace is
+    # <= 8 spaces is treated as a section start.
+    section_start = header_line_count
+    section_lines: List[str] = []
+    for i, line in enumerate(lines[header_line_count:], start=header_line_count):
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        is_section = (
+            indent <= 8
+            and stripped.startswith('<')
+            and any(stripped.startswith(f'<{tag}') for tag in _AXAML_TOP_LEVEL_TAGS)
+        )
+        if is_section and section_lines:
+            section_text = '\n'.join(section_lines)
+            if section_text.strip():
+                chunks.append({
+                    'file': str(file_path),
+                    'lines': f"{section_start + 1}-{i}",
+                    'content': section_text[:4000],
+                })
+            section_lines = [line]
+            section_start = i
+        else:
+            section_lines.append(line)
+
+    if section_lines:
+        section_text = '\n'.join(section_lines)
+        if section_text.strip():
+            chunks.append({
+                'file': str(file_path),
+                'lines': f"{section_start + 1}-{len(lines)}",
+                'content': section_text[:4000],
+            })
+
+    # Final chunk: compact binding index — captures every {Binding ...},
+    # x:DataType, x:Class, x:Name. Lets a single embedding cover all
+    # data-binding surfaces of the file.
+    bindings = _AXAML_BINDING_RE.findall(content)
+    if bindings:
+        # Deduplicate while preserving order
+        seen = set()
+        unique_bindings = []
+        for b in bindings:
+            if b not in seen:
+                seen.add(b)
+                unique_bindings.append(b)
+        chunks.append({
+            'file': str(file_path),
+            'lines': '1-end (bindings)',
+            'content': '\n'.join(unique_bindings)[:4000],
         })
 
     return chunks
@@ -162,19 +262,34 @@ def build_index(repo_root: Path, force_rebuild: bool = False) -> Dict:
     print(f"Computing embeddings...", file=sys.stderr)
     texts = [chunk['content'] for chunk in all_chunks]
 
-    # Batch embeddings (max 2048 per request)
-    batch_size = 2048
+    # Batch embeddings under both limits: max 2048 items AND ~280K chars
+    # per request (OpenAI's hard cap is 300K tokens; chars ≈ 4× tokens, so
+    # 280K chars stays well below 300K tokens for safety).
+    MAX_ITEMS_PER_BATCH = 2048
+    MAX_CHARS_PER_BATCH = 280_000
     all_embeddings = []
+    batch: List[str] = []
+    batch_chars = 0
+    batch_num = 0
 
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        print(f"  Batch {i//batch_size + 1}/{(len(texts)-1)//batch_size + 1}", file=sys.stderr)
-
-        response = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=batch
-        )
+    def flush_batch() -> None:
+        nonlocal batch, batch_chars, batch_num
+        if not batch:
+            return
+        batch_num += 1
+        print(f"  Batch {batch_num} ({len(batch)} items, {batch_chars} chars)", file=sys.stderr)
+        response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
         all_embeddings.extend([item.embedding for item in response.data])
+        batch = []
+        batch_chars = 0
+
+    for text in texts:
+        text_len = len(text)
+        if batch and (len(batch) >= MAX_ITEMS_PER_BATCH or batch_chars + text_len > MAX_CHARS_PER_BATCH):
+            flush_batch()
+        batch.append(text)
+        batch_chars += text_len
+    flush_batch()
 
     # Build index
     index = {
@@ -254,9 +369,6 @@ def main():
     # Fallback: use current working directory
     else:
         repo_root = Path.cwd()
-
-    # Resolve to absolute path (handles ../repo correctly)
-    repo_root = repo_root.resolve()
 
     if not repo_root.exists():
         print(f"ERROR: Repository not found at {repo_root}", file=sys.stderr)
