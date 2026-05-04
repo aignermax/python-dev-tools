@@ -62,6 +62,26 @@ EXCLUDE_PATTERNS = [
     "**/node_modules/**",
 ]
 
+# Markers that indicate a directory is the root of a project of any common
+# language. Used to auto-locate the repo when the tool is installed inside
+# a project's tools/ subdirectory.
+_PROJECT_ROOT_MARKERS = (
+    ".git", "pyproject.toml", "setup.py", "Cargo.toml", "go.mod", "package.json",
+)
+_PROJECT_ROOT_GLOBS = ("*.sln", "*.csproj")
+
+
+def _looks_like_project_root(p: Path) -> bool:
+    if not p.exists():
+        return False
+    for marker in _PROJECT_ROOT_MARKERS:
+        if (p / marker).exists():
+            return True
+    for pattern in _PROJECT_ROOT_GLOBS:
+        if any(p.glob(pattern)):
+            return True
+    return False
+
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:
     """Compute cosine similarity between two vectors."""
@@ -289,7 +309,25 @@ def build_index(repo_root: Path, force_rebuild: bool = False) -> Dict:
             return
         batch_num += 1
         print(f"  Batch {batch_num} ({len(batch)} items, {batch_chars} chars)", file=sys.stderr)
-        response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        try:
+            response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        except Exception as e:
+            # Indexing a large repo can take minutes and OpenAI 429/500 are
+            # the most common transient failures. Surface enough context for
+            # the user to know what failed and where, then re-raise — partial
+            # state is not safe to persist. Don't include the chunk content
+            # itself: it's user source code and could contain secrets that
+            # CI logs would archive.
+            print(
+                f"ERROR: embedding batch {batch_num} failed "
+                f"({type(e).__name__}: {e}).",
+                file=sys.stderr,
+            )
+            print(
+                f"  items={len(batch)} chars={batch_chars}",
+                file=sys.stderr,
+            )
+            raise
         all_embeddings.extend([item.embedding for item in response.data])
         batch.clear()
         batch_chars = 0
@@ -367,24 +405,21 @@ def main():
 
     query = ' '.join(sys.argv[1:])
 
-    # Determine repo root - support two scenarios:
-    # 1. Tool in autonomous-issue-agent/tools/ → repo is ../repo/
-    # 2. Tool in Connect-A-PIC-Pro/tools/ → repo is ../
+    # Determine repo root. Two install layouts are supported:
+    #   1. Tool inside the project — typically `<project>/tools/semantic_search.py`,
+    #      so the project sits at `parent_dir`.
+    #   2. Tool installed outside the project — fall back to the cwd, which is
+    #      where the user invoked us from.
+    # The autonomous-issue-agent layout (`<base>/tools/` next to `<base>/repo/`)
+    # is also still supported via the explicit `repo/` check.
 
     tool_dir = Path(__file__).parent
     parent_dir = tool_dir.parent
 
-    # First check if parent directory looks like the actual project (has .sln or .csproj)
-    has_solution = list(parent_dir.glob("*.sln"))
-    has_project = (parent_dir / "Connect-A-Pic-Core").exists()
-
-    if has_solution or has_project:
-        # We're directly in the project! (tools/ is inside Connect-A-PIC-Pro/)
+    if _looks_like_project_root(parent_dir):
         repo_root = parent_dir
-    # Otherwise check if we're in autonomous-issue-agent setup (has separate repo/ directory)
     elif (parent_dir / "repo").exists():
         repo_root = parent_dir / "repo"
-    # Fallback: use current working directory
     else:
         repo_root = Path.cwd()
 
