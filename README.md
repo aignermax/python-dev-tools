@@ -196,9 +196,9 @@ These tools can be integrated into your CI/CD pipeline:
   run: python smart_test.py
 ```
 
-## Integration with Autonomous Issue Agent
+## Integration with the Lunima team agent
 
-These tools are designed to work seamlessly with the [Autonomous Issue Agent](https://github.com/Akhetonics/autonomous-issue-agent), which can automatically use them to:
+These tools are designed to work with the [Lunima team agent](https://github.com/aignermax/lunima-agent-loop) (the Rust successor of the retired Python autonomous-issue-agent), which installs them into `~/.cap-tools` and uses them to:
 - Search codebases semantically when implementing features
 - Run only relevant tests after making changes
 - Improve development efficiency
